@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Télécharge automatiquement les images reçues en message privé sur Discord.
 
-Fonctionne sur Android via Termux. L'outil est en lecture seule : il écoute
-tes conversations privées et enregistre les images dans la galerie, il
+Fonctionne sur ordinateur (Windows, macOS, Linux) et sur Android via Termux.
+L'outil est en lecture seule : il écoute
+tes conversations privées et enregistre les images dans un dossier, il
 n'envoie jamais de message.
 
 Commandes :
@@ -59,9 +60,18 @@ FATAL_CLOSE_CODES = {
     4014: "intents non autorisés",
 }
 
+ANDROID_STORAGE = Path("/storage/emulated/0")
+
+
+def default_download_dir():
+    if ANDROID_STORAGE.is_dir():
+        return str(ANDROID_STORAGE / "Pictures" / "Discord")
+    return str(Path.home() / "Pictures" / "Discord")
+
+
 DEFAULT_CONFIG = {
     "token": "",
-    "download_dir": "/storage/emulated/0/Pictures/Discord",
+    "download_dir": default_download_dir(),
     "channels": [],
     "include_group_dms": True,
     "include_own_messages": False,
@@ -576,7 +586,8 @@ def cmd_select(cfg, args):
 
 def cmd_setup(cfg, args):
     print("Configuration de Discord Images\n")
-    print("Colle ton token Discord (il ne s'affichera pas). Voir le README pour le récupérer.")
+    print("Colle ton token Discord (Ctrl+V ou clic droit), puis appuie sur Entrée.")
+    print("Il ne s'affiche pas pendant que tu le colles, c'est normal.")
     token = getpass.getpass("Token : ").strip().strip('"')
     if token:
         cfg["token"] = token
@@ -609,6 +620,7 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"),
                         help="fichier de configuration (défaut : config.json à côté du script)")
     parser.add_argument("-v", "--verbose", action="store_true", help="affiche plus de détails")
+    parser.add_argument("--log-file", type=Path, help="écrit le journal dans ce fichier")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("setup", help="configure le token, le dossier et les conversations")
@@ -624,7 +636,9 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+                        filename=args.log_file, encoding="utf-8",
+                        format="%(asctime)s %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S" if args.log_file else "%H:%M:%S")
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     cfg = load_config(args.config)
@@ -633,7 +647,10 @@ def main(argv=None):
     try:
         commands[args.command](cfg, args)
     except FatalError as e:
-        print(f"Erreur : {e}", file=sys.stderr)
+        if args.log_file:
+            log.error("Erreur : %s", e)
+        else:
+            print(f"Erreur : {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\nArrêté.")

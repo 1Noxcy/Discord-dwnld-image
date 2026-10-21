@@ -1,12 +1,13 @@
 import sys
+import threading
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import discord_images as di  # noqa: E402
 
-CFG = dict(di.DEFAULT_CONFIG, download_dir="/tmp/dl")
-ME = "100"
+OPTS = dict(di.DEFAULT_OPTIONS, download_dir="/tmp/dl")
 
 
 def msg(**kw):
@@ -16,8 +17,28 @@ def msg(**kw):
     return base
 
 
-def test_snowflake_time():
-    assert di.snowflake_time("175928847299117063").year == 2016
+def test_snowflake_roundtrip():
+    when = datetime(2024, 5, 1, 12, 0).astimezone()
+    assert di.snowflake_time(di.snowflake_from_time(when)) == when
+
+
+def test_parse_date():
+    assert di.parse_date("") is None
+    assert di.parse_date("03/02/2024").strftime("%Y-%m-%d") == "2024-02-03"
+    try:
+        di.parse_date("31/31/2024")
+        assert False
+    except ValueError:
+        pass
+
+
+def test_date_bounds_include_whole_days():
+    start, end = di.parse_date("01/05/2024"), di.parse_date("02/05/2024")
+    after, before = di.date_bounds(start, end)
+    first = di.snowflake_from_time(start)
+    last = di.snowflake_from_time(di.parse_date("03/05/2024")) - 1
+    assert after < first and last < before
+    assert di.date_bounds(None, None) == (None, None)
 
 
 def test_sanitize():
@@ -30,21 +51,6 @@ def test_conversation_name():
     assert di.conversation_name({"name": "Les potes", "recipients": []}) == "Les potes"
 
 
-def test_should_handle_filters():
-    assert di.should_handle(msg(), di.CHANNEL_DM, CFG, ME)
-    assert not di.should_handle(msg(guild_id="9"), None, CFG, ME)
-    assert not di.should_handle(msg(author={"id": ME}), di.CHANNEL_DM, CFG, ME)
-    assert di.should_handle(msg(author={"id": ME}), di.CHANNEL_DM, dict(CFG, include_own_messages=True), ME)
-    assert not di.should_handle(msg(), di.CHANNEL_GROUP_DM, dict(CFG, include_group_dms=False), ME)
-    assert not di.should_handle(msg(), 0, CFG, ME)  # salon texte de serveur
-
-
-def test_should_handle_selection():
-    selected = dict(CFG, channels=["42"])
-    assert di.should_handle(msg(), di.CHANNEL_DM, selected, ME)
-    assert not di.should_handle(msg(channel_id="43"), di.CHANNEL_DM, selected, ME)
-
-
 def test_extract_attachments():
     m = msg(attachments=[
         {"id": "1", "filename": "photo.JPG", "url": "https://cdn/1"},
@@ -52,8 +58,13 @@ def test_extract_attachments():
         {"id": "3", "filename": "clip.mp4", "url": "https://cdn/3", "content_type": "video/mp4"},
         {"id": "4", "filename": "image", "url": "https://cdn/4", "content_type": "image/png"},
     ])
-    assert [k for _, k, _ in di.extract_media(m, CFG)] == ["1", "4"]
-    assert [k for _, k, _ in di.extract_media(m, dict(CFG, include_videos=True))] == ["1", "3", "4"]
+    assert [k for _, k, _ in di.extract_media(m, OPTS)] == ["1", "4"]
+    assert [k for _, k, _ in di.extract_media(m, dict(OPTS, include_videos=True))] == ["1", "3", "4"]
+
+
+def test_extract_spoiler():
+    m = msg(attachments=[{"id": "5", "filename": "SPOILER_chat.png", "url": "https://cdn/5"}])
+    assert di.extract_media(m, OPTS) == [("https://cdn/5", "5", "chat.png")]
 
 
 def test_extract_embeds():
@@ -62,51 +73,56 @@ def test_extract_embeds():
         {"type": "rich", "image": {"url": "https://ex.com/b.jpg"}},
         {"type": "link", "title": "pas d'image"},
     ])
-    found = di.extract_media(m, CFG)
+    found = di.extract_media(m, OPTS)
     assert [f for _, _, f in found] == ["a.png", "b.jpg"]
-    assert di.extract_media(m, dict(CFG, include_embeds=False)) == []
-    # La clé ne dépend pas des paramètres signés de l'URL (évite les doublons).
+    assert di.extract_media(m, dict(OPTS, include_embeds=False)) == []
     m2 = msg(embeds=[{"type": "image", "thumbnail": {"url": "https://ex.com/a.png?x=2"}}])
-    assert di.extract_media(m2, CFG)[0][1] == found[0][1]
+    assert di.extract_media(m2, OPTS)[0][1] == found[0][1]
 
 
 def test_build_path():
-    p = di.build_path(CFG, "Bob/Alice", "1290000000000000000", "1", "photo.jpg")
+    p = di.build_path(OPTS, "Bob/Alice", "1290000000000000000", "1", "photo.jpg")
     assert p.parent == Path("/tmp/dl/Bob_Alice")
     assert p.name.endswith("_1_photo.jpg")
-    flat = di.build_path(dict(CFG, subfolder_per_conversation=False), "Bob", "1290000000000000000", "1", "x.png")
+    flat = di.build_path(dict(OPTS, subfolder_per_conversation=False), "Bob", "1290000000000000000", "1", "x.png")
     assert flat.parent == Path("/tmp/dl")
 
 
-def test_handle_message_skips_existing(tmp_path, monkeypatch):
-    cfg = dict(CFG, download_dir=str(tmp_path), token="t", media_scan=False)
-    app = di.App(cfg)
-    app.my_id = ME
-    app.channels = {"42": {"id": "42", "type": di.CHANNEL_DM, "recipients": [{"username": "bob"}]}}
-    app.channels_refreshed = float("inf")
-    submitted = []
-    monkeypatch.setattr(app.downloader, "_download", lambda url, path: submitted.append(path))
+class FakeAPI:
+    def __init__(self, messages):
+        self._messages = messages
+        self.calls = []
 
-    m = msg(attachments=[{"id": "7", "filename": "a.png", "url": "https://cdn/7"}])
-    assert app.handle_message(m) == 1
-    app.downloader.close()
-    assert submitted[0].parent == tmp_path / "bob"
-
-    submitted[0].parent.mkdir(parents=True)
-    submitted[0].touch()
-    app.downloader = di.Downloader(cfg)
-    assert app.handle_message(m) == 0
+    def messages(self, channel_id, after=None, before=None):
+        self.calls.append((channel_id, after, before))
+        return iter(self._messages)
 
 
-def test_update_without_author_follows_create():
-    cfg = dict(CFG, token="t", media_scan=False)
-    app = di.App(cfg)
-    app.my_id = ME
-    app.channels = {"42": {"id": "42", "type": di.CHANNEL_DM}}
-    app.channels_refreshed = float("inf")
-    app.downloader.submit = lambda url, path: True
-    own = msg(author={"id": ME})
-    app.handle_message(own)
-    update = {"id": own["id"], "channel_id": "42",
-              "embeds": [{"type": "image", "thumbnail": {"url": "https://ex.com/a.png"}}]}
-    assert app.handle_message(update, is_update=True) == 0
+def test_run_download(tmp_path, monkeypatch):
+    saved = []
+
+    def fake_download(session, url, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        saved.append(path)
+
+    monkeypatch.setattr(di, "download_file", fake_download)
+    api = FakeAPI([
+        msg(id="1290000000000000001", attachments=[{"id": "7", "filename": "a.png", "url": "u7"}]),
+        msg(id="1290000000000000002", author={"id": "100"},
+            attachments=[{"id": "8", "filename": "mine.png", "url": "u8"}]),
+    ])
+    channel = {"id": "42", "type": 1, "recipients": [{"username": "bob"}]}
+    opts = dict(OPTS, download_dir=str(tmp_path))
+    reports = []
+
+    stats = di.run_download(api, [channel], opts, "100", lambda *a: reports.append(a), threading.Event())
+    assert stats == {"saved": 1, "skipped": 0, "failed": 0}
+    assert saved[0].parent == tmp_path / "bob"
+
+    stats = di.run_download(api, [channel], opts, "100", lambda *a: None, threading.Event())
+    assert stats == {"saved": 0, "skipped": 1, "failed": 0}
+
+    stats = di.run_download(api, [channel], dict(opts, include_own_messages=True), "100",
+                            lambda *a: None, threading.Event())
+    assert stats["saved"] == 1

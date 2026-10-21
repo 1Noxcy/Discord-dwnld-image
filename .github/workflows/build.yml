@@ -1,0 +1,36 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [claude/discord-auto-download-images-0y6r7w, main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pyinstaller==6.11.1
+      - name: Test
+        run: python -m pytest -q
+      - name: Build
+        run: pyinstaller --onefile --windowed --name DiscordImages discord_images.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DiscordImages
+          path: dist/DiscordImages.exe
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Discord Images (Windows)
+          body: Télécharge DiscordImages.exe puis double-clique dessus.
+          files: dist/DiscordImages.exe
+          make_latest: true

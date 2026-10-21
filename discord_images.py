@@ -1,87 +1,47 @@
 #!/usr/bin/env python3
-"""Télécharge automatiquement les images reçues en message privé sur Discord.
+"""Discord Images : enregistre les images de tes conversations privées Discord.
 
-Fonctionne sur ordinateur (Windows, macOS, Linux) et sur Android via Termux.
-L'outil est en lecture seule : il écoute
-tes conversations privées et enregistre les images dans un dossier, il
-n'envoie jamais de message.
-
-Commandes :
-    setup     configure le token, le dossier et les conversations à suivre
-    select    choisit les conversations à suivre
-    dms       liste tes conversations privées
-    watch     télécharge en temps réel les nouvelles images
-    backfill  télécharge les images déjà présentes dans l'historique
+Double-clique sur l'application, connecte-toi avec ton token, choisis les
+conversations et éventuellement une période, puis clique sur « Télécharger ».
+L'outil est en lecture seule : il n'envoie jamais de message.
 """
 
-import argparse
-import getpass
 import hashlib
 import json
-import logging
 import os
-import random
+import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-import websocket
 
 API = "https://discord.com/api/v10"
-GATEWAY = "wss://gateway.discord.gg"
-GATEWAY_QUERY = "/?v=10&encoding=json"
 DISCORD_EPOCH_MS = 1420070400000
 USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 )
+CONFIG_PATH = Path.home() / ".discord_images.json"
 
-CHANNEL_DM = 1
 CHANNEL_GROUP_DM = 3
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".avif"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 
-# Codes de fermeture du gateway après lesquels il ne sert à rien de réessayer.
-FATAL_CLOSE_CODES = {
-    4004: "token invalide (il a peut-être changé : reconnecte-toi et récupère-le à nouveau)",
-    4010: "shard invalide",
-    4011: "sharding requis",
-    4012: "version d'API invalide",
-    4013: "intents invalides",
-    4014: "intents non autorisés",
-}
-
-ANDROID_STORAGE = Path("/storage/emulated/0")
-
-
-def default_download_dir():
-    if ANDROID_STORAGE.is_dir():
-        return str(ANDROID_STORAGE / "Pictures" / "Discord")
-    return str(Path.home() / "Pictures" / "Discord")
-
-
-DEFAULT_CONFIG = {
-    "token": "",
-    "download_dir": default_download_dir(),
-    "channels": [],
-    "include_group_dms": True,
+DEFAULT_OPTIONS = {
+    "download_dir": str(Path.home() / "Pictures" / "Discord"),
     "include_own_messages": False,
     "include_videos": False,
     "include_embeds": True,
     "subfolder_per_conversation": True,
-    "media_scan": True,
 }
-
-log = logging.getLogger("discord-images")
 
 
 class FatalError(Exception):
@@ -92,31 +52,22 @@ class FatalError(Exception):
 # Configuration
 # --------------------------------------------------------------------------
 
-def load_config(path):
-    cfg = dict(DEFAULT_CONFIG)
-    if path.exists():
+def load_config(path=CONFIG_PATH):
+    cfg = dict(DEFAULT_OPTIONS, token="", selected=[])
+    try:
         with path.open(encoding="utf-8") as f:
             cfg.update(json.load(f))
-    if os.environ.get("DISCORD_TOKEN"):
-        cfg["token"] = os.environ["DISCORD_TOKEN"]
-    cfg["channels"] = [str(c) for c in cfg.get("channels", [])]
+    except (OSError, ValueError):
+        pass
     return cfg
 
 
-def save_config(path, cfg):
+def save_config(cfg, path=CONFIG_PATH):
     tmp = path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
-        f.write("\n")
     os.chmod(tmp, 0o600)
     tmp.replace(path)
-
-
-def require_token(cfg):
-    token = cfg.get("token", "").strip()
-    if not token:
-        raise FatalError("Aucun token configuré. Lance d'abord : python discord_images.py setup")
-    return token
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +77,31 @@ def require_token(cfg):
 def snowflake_time(snowflake):
     ms = (int(snowflake) >> 22) + DISCORD_EPOCH_MS
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
+def snowflake_from_time(when):
+    ms = int(when.timestamp() * 1000) - DISCORD_EPOCH_MS
+    return max(ms, 0) << 22
+
+
+def parse_date(text):
+    """« JJ/MM/AAAA » -> datetime locale à minuit, ou None si vide."""
+    text = text.strip()
+    if not text:
+        return None
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).astimezone()
+        except ValueError:
+            pass
+    raise ValueError(f"Date invalide : « {text} » (format attendu : JJ/MM/AAAA)")
+
+
+def date_bounds(date_from, date_to):
+    """Convertit une période (dates incluses) en bornes after/before de l'API."""
+    after = snowflake_from_time(date_from) - 1 if date_from else None
+    before = snowflake_from_time(date_to + timedelta(days=1)) if date_to else None
+    return after, before
 
 
 def sanitize(name, max_len=80):
@@ -161,19 +137,21 @@ def media_kind(filename, content_type=None):
     return None
 
 
-def _wanted(kind, cfg):
-    return kind == "image" or (kind == "video" and cfg.get("include_videos"))
+def _wanted(kind, opts):
+    return kind == "image" or (kind == "video" and opts.get("include_videos"))
 
 
-def extract_media(msg, cfg):
+def extract_media(msg, opts):
     """Liste des médias d'un message : tuples (url, clé unique, nom de fichier)."""
     items = []
     for att in msg.get("attachments") or []:
         filename = att.get("filename", "fichier")
-        if _wanted(media_kind(filename, att.get("content_type")), cfg):
-            items.append((att.get("url") or att.get("proxy_url"), att["id"], filename))
+        if _wanted(media_kind(filename, att.get("content_type")), opts):
+            # Les images avec spoiler sont des pièces jointes nommées SPOILER_xxx.
+            clean = filename[len("SPOILER_"):] if filename.startswith("SPOILER_") else filename
+            items.append((att.get("url") or att.get("proxy_url"), att["id"], clean or filename))
 
-    if not cfg.get("include_embeds"):
+    if not opts.get("include_embeds"):
         return items
     for embed in msg.get("embeds") or []:
         candidates = []
@@ -181,7 +159,7 @@ def extract_media(msg, cfg):
             candidates.append(embed["image"])
         if embed.get("type") == "image" and embed.get("thumbnail"):
             candidates.append(embed["thumbnail"])
-        if embed.get("type") == "gifv" and embed.get("video") and cfg.get("include_videos"):
+        if embed.get("type") == "gifv" and embed.get("video") and opts.get("include_videos"):
             candidates.append(embed["video"])
         for media in candidates:
             url = media.get("url") or media.get("proxy_url")
@@ -189,61 +167,46 @@ def extract_media(msg, cfg):
                 continue
             filename = Path(urlparse(url).path).name or "embed"
             kind = media_kind(filename, media.get("content_type")) or "image"
-            if not _wanted(kind, cfg):
+            if not _wanted(kind, opts):
                 continue
             key = hashlib.sha1(url.split("?")[0].encode()).hexdigest()[:12]
             items.append((url, key, filename))
-            break  # une seule version (image ou miniature) par embed
+            break  # une seule version (image ou miniature) par lien
     return items
 
 
-def should_handle(msg, channel_type, cfg, my_id):
-    """Décide si un message doit être traité selon la configuration."""
-    if msg.get("guild_id"):
-        return False  # message de serveur, pas un MP
-    if channel_type not in (None, CHANNEL_DM, CHANNEL_GROUP_DM):
-        return False
-    if channel_type == CHANNEL_GROUP_DM and not cfg.get("include_group_dms"):
-        return False
-    if cfg.get("channels") and str(msg.get("channel_id")) not in cfg["channels"]:
-        return False
-    author = msg.get("author") or {}
-    if my_id and author.get("id") == my_id and not cfg.get("include_own_messages"):
-        return False
-    return True
-
-
-def build_path(cfg, conversation, message_id, key, filename):
+def build_path(opts, conversation, message_id, key, filename):
     when = snowflake_time(message_id).astimezone()
     name = f"{when:%Y-%m-%d_%H%M%S}_{key}_{sanitize(filename, 60)}"
-    base = Path(cfg["download_dir"])
-    if cfg.get("subfolder_per_conversation"):
+    base = Path(opts["download_dir"])
+    if opts.get("subfolder_per_conversation"):
         base = base / sanitize(conversation)
     return base / name
 
 
 # --------------------------------------------------------------------------
-# API REST
+# Réseau
 # --------------------------------------------------------------------------
 
 class DiscordAPI:
     def __init__(self, token):
         self.session = requests.Session()
-        self.session.headers.update({"Authorization": token, "User-Agent": USER_AGENT})
+        self.session.headers.update({"Authorization": token.strip().strip('"'),
+                                     "User-Agent": USER_AGENT})
 
     def get(self, path, params=None):
         for _ in range(10):
             r = self.session.get(API + path, params=params, timeout=30)
             if r.status_code == 429:
-                wait = float(r.json().get("retry_after", 1))
-                log.debug("Limite de requêtes atteinte, pause de %.1fs", wait)
-                time.sleep(wait + 0.25)
+                time.sleep(float(r.json().get("retry_after", 1)) + 0.25)
                 continue
             if r.status_code == 401:
-                raise FatalError("Token refusé par Discord (401). Relance : python discord_images.py setup")
+                raise FatalError("Token refusé par Discord. Vérifie-le, ou récupère-le à nouveau.")
+            if r.status_code == 403:
+                raise FatalError("Accès refusé à cette conversation.")
             r.raise_for_status()
             return r.json()
-        raise RuntimeError(f"Trop de limitations de requêtes sur {path}")
+        raise FatalError("Discord limite trop les requêtes, réessaie dans quelques minutes.")
 
     def me(self):
         return self.get("/users/@me")
@@ -253,9 +216,8 @@ class DiscordAPI:
         channels.sort(key=lambda c: int(c.get("last_message_id") or 0), reverse=True)
         return channels
 
-    def messages(self, channel_id, after=None):
+    def messages(self, channel_id, after=None, before=None):
         """Parcourt l'historique d'un salon, du plus récent au plus ancien."""
-        before = None
         while True:
             params = {"limit": 100}
             if before:
@@ -270,392 +232,347 @@ class DiscordAPI:
             before = batch[-1]["id"]
 
 
-# --------------------------------------------------------------------------
-# Téléchargement
-# --------------------------------------------------------------------------
+def download_file(session, url, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    part = path.with_name(path.name + ".part")
+    with session.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with part.open("wb") as f:
+            for chunk in r.iter_content(64 * 1024):
+                f.write(chunk)
+    part.replace(path)
 
-class Downloader:
-    def __init__(self, cfg, workers=3):
-        self.cfg = cfg
-        self.http = requests.Session()
-        self.http.headers["User-Agent"] = USER_AGENT
-        self.pool = ThreadPoolExecutor(max_workers=workers)
-        self.can_scan = bool(cfg.get("media_scan")) and shutil.which("termux-media-scan")
-        self.saved = 0
 
-    def submit(self, url, path):
-        if path.exists():
-            return None
-        return self.pool.submit(self._download, url, path)
+def run_download(api, channels, opts, my_id, report, cancel):
+    """Télécharge les médias des conversations choisies.
 
-    def _download(self, url, path):
+    report(type, valeur) reçoit l'avancement ; cancel est un threading.Event.
+    """
+    after, before = date_bounds(opts.get("date_from"), opts.get("date_to"))
+    stats = {"saved": 0, "skipped": 0, "failed": 0}
+    lock = threading.Lock()
+    http = requests.Session()
+    http.headers["User-Agent"] = USER_AGENT
+
+    def fetch(url, path):
+        if cancel.is_set():
+            return
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            part = path.with_name(path.name + ".part")
-            with self.http.get(url, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                with part.open("wb") as f:
-                    for chunk in r.iter_content(64 * 1024):
-                        f.write(chunk)
-            part.replace(path)
-            self.saved += 1
-            log.info("Enregistré : %s", path)
-            if self.can_scan:
-                # Fait apparaître l'image dans la galerie immédiatement.
-                subprocess.run(["termux-media-scan", str(path)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            download_file(http, url, path)
+            result = "saved"
         except Exception as e:
-            log.warning("Échec du téléchargement de %s : %s", url, e)
+            report("log", f"Échec : {path.name} ({e})")
+            result = "failed"
+        with lock:
+            stats[result] += 1
+            snapshot = dict(stats)
+        report("stats", snapshot)
 
-    def close(self):
-        self.pool.shutdown(wait=True)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for channel in channels:
+            if cancel.is_set():
+                break
+            name = conversation_name(channel)
+            report("log", f"Conversation « {name} »…")
+            found = 0
+            for msg in api.messages(channel["id"], after=after, before=before):
+                if cancel.is_set():
+                    break
+                author = (msg.get("author") or {}).get("id")
+                if author == my_id and not opts.get("include_own_messages"):
+                    continue
+                for url, key, filename in extract_media(msg, opts):
+                    path = build_path(opts, name, msg["id"], key, filename)
+                    if path.exists():
+                        with lock:
+                            stats["skipped"] += 1
+                        continue
+                    found += 1
+                    pool.submit(fetch, url, path)
+            report("log", f"  {found} nouveau(x) fichier(s)")
+    return stats
 
 
 # --------------------------------------------------------------------------
-# Gateway (temps réel)
+# Interface graphique
 # --------------------------------------------------------------------------
 
-class Gateway:
-    def __init__(self, token, on_dispatch):
-        self.token = token
-        self.on_dispatch = on_dispatch
-        self.session_id = None
-        self.resume_url = None
-        self.seq = None
-        self.ws = None
-        self.send_lock = threading.Lock()
+def run_gui():
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
 
-    def run_forever(self):
-        backoff = 1
-        while True:
-            started = time.monotonic()
+    class App(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("Discord Images")
+            self.geometry("620x700")
+            self.minsize(520, 580)
+            self.cfg = load_config()
+            self.api = None
+            self.my_id = None
+            self.channels = []
+            self.events = queue.Queue()
+            self.cancel = threading.Event()
+            self.worker = None
+            self._build()
+            self.after(100, self._poll)
+
+        # ---- construction de la fenêtre --------------------------------
+
+        def _build(self):
+            pad = {"padx": 10, "pady": 4}
+
+            box = ttk.LabelFrame(self, text="1. Connexion")
+            box.pack(fill="x", **pad)
+            ttk.Label(box, text="Token :").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+            self.token = tk.StringVar(value=self.cfg.get("token", ""))
+            ttk.Entry(box, textvariable=self.token, show="•").grid(row=0, column=1, sticky="ew", pady=6)
+            self.login_btn = ttk.Button(box, text="Se connecter", command=self.login)
+            self.login_btn.grid(row=0, column=2, padx=6)
+            self.remember = tk.BooleanVar(value=bool(self.cfg.get("token")))
+            ttk.Checkbutton(box, text="Se souvenir du token sur cet ordinateur",
+                            variable=self.remember).grid(row=1, column=1, sticky="w")
+            self.user_label = ttk.Label(box, text="")
+            self.user_label.grid(row=2, column=1, sticky="w", pady=(0, 6))
+            box.columnconfigure(1, weight=1)
+
+            box = ttk.LabelFrame(self, text="2. Conversations (clique pour cocher / décocher)")
+            box.pack(fill="both", expand=True, **pad)
+            bar = ttk.Frame(box)
+            bar.pack(fill="x", padx=6, pady=4)
+            ttk.Label(bar, text="Rechercher :").pack(side="left")
+            self.search = tk.StringVar()
+            self.search.trace_add("write", lambda *_: self._fill_list())
+            ttk.Entry(bar, textvariable=self.search).pack(side="left", fill="x", expand=True, padx=6)
+            ttk.Button(bar, text="Tout", command=lambda: self._select_all(True)).pack(side="left")
+            ttk.Button(bar, text="Aucune", command=lambda: self._select_all(False)).pack(side="left")
+            frame = ttk.Frame(box)
+            frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+            self.listbox = tk.Listbox(frame, selectmode="multiple", activestyle="none",
+                                      exportselection=False, selectbackground="#2563eb",
+                                      selectforeground="white")
+            scroll = ttk.Scrollbar(frame, command=self.listbox.yview)
+            self.listbox.configure(yscrollcommand=scroll.set)
+            self.listbox.pack(side="left", fill="both", expand=True)
+            scroll.pack(side="right", fill="y")
+            self.listbox.bind("<<ListboxSelect>>", self._on_select)
+            self.selected = set(self.cfg.get("selected", []))
+            self.shown = []
+
+            box = ttk.LabelFrame(self, text="3. Options")
+            box.pack(fill="x", **pad)
+            ttk.Label(box, text="Du (JJ/MM/AAAA) :").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+            self.date_from = tk.StringVar()
+            ttk.Entry(box, textvariable=self.date_from, width=12).grid(row=0, column=1, sticky="w")
+            ttk.Label(box, text="au :").grid(row=0, column=2, sticky="e", padx=6)
+            self.date_to = tk.StringVar()
+            ttk.Entry(box, textvariable=self.date_to, width=12).grid(row=0, column=3, sticky="w")
+            ttk.Label(box, text="(vide = tout)").grid(row=0, column=4, sticky="w", padx=6)
+
+            ttk.Label(box, text="Dossier :").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+            self.folder = tk.StringVar(value=self.cfg["download_dir"])
+            ttk.Entry(box, textvariable=self.folder).grid(row=1, column=1, columnspan=3, sticky="ew")
+            ttk.Button(box, text="Parcourir…", command=self.browse).grid(row=1, column=4, padx=6)
+
+            self.opt_vars = {}
+            labels = [
+                ("subfolder_per_conversation", "Un sous-dossier par conversation"),
+                ("include_own_messages", "Inclure les images que j'ai envoyées"),
+                ("include_videos", "Inclure les vidéos"),
+                ("include_embeds", "Inclure les images des liens partagés"),
+            ]
+            for i, (key, label) in enumerate(labels):
+                var = tk.BooleanVar(value=self.cfg.get(key, DEFAULT_OPTIONS[key]))
+                self.opt_vars[key] = var
+                ttk.Checkbutton(box, text=label, variable=var).grid(
+                    row=2 + i // 2, column=(i % 2) * 2, columnspan=2 + (i % 2), sticky="w", padx=6, pady=2)
+            box.columnconfigure(1, weight=1)
+
+            bar = ttk.Frame(self)
+            bar.pack(fill="x", **pad)
+            self.start_btn = ttk.Button(bar, text="Télécharger", command=self.start, state="disabled")
+            self.start_btn.pack(side="left")
+            self.cancel_btn = ttk.Button(bar, text="Annuler", command=self.cancel.set, state="disabled")
+            self.cancel_btn.pack(side="left", padx=6)
+            ttk.Button(bar, text="Ouvrir le dossier", command=self.open_folder).pack(side="right")
+            self.progress = ttk.Progressbar(self, mode="indeterminate")
+            self.progress.pack(fill="x", padx=10)
+            self.status = ttk.Label(self, text="Colle ton token puis clique sur « Se connecter ».")
+            self.status.pack(fill="x", padx=10, pady=2)
+            self.log = tk.Text(self, height=7, state="disabled", wrap="word")
+            self.log.pack(fill="both", padx=10, pady=(0, 10))
+
+        # ---- liste des conversations -----------------------------------
+
+        def _fill_list(self):
+            term = self.search.get().strip().lower()
+            self.shown = [c for c in self.channels if term in conversation_name(c).lower()]
+            self.listbox.delete(0, "end")
+            for i, c in enumerate(self.shown):
+                prefix = "[groupe] " if c.get("type") == CHANNEL_GROUP_DM else ""
+                self.listbox.insert("end", prefix + conversation_name(c))
+                if c["id"] in self.selected:
+                    self.listbox.selection_set(i)
+            self._update_count()
+
+        def _on_select(self, _event=None):
+            picked = set(self.listbox.curselection())
+            for i, c in enumerate(self.shown):
+                if i in picked:
+                    self.selected.add(c["id"])
+                else:
+                    self.selected.discard(c["id"])
+            self._update_count()
+
+        def _select_all(self, value):
+            for c in self.shown:
+                if value:
+                    self.selected.add(c["id"])
+                else:
+                    self.selected.discard(c["id"])
+            self._fill_list()
+
+        def _update_count(self):
+            if self.channels and not self._busy():
+                n = len(self.selected & {c["id"] for c in self.channels})
+                self.status.config(text=f"{n} conversation(s) sélectionnée(s)")
+
+        # ---- actions -----------------------------------------------------
+
+        def _busy(self):
+            return self.worker is not None and self.worker.is_alive()
+
+        def _run(self, target):
+            self.worker = threading.Thread(target=target, daemon=True)
+            self.worker.start()
+
+        def login(self):
+            token = self.token.get().strip().strip('"')
+            if not token:
+                messagebox.showwarning("Discord Images", "Colle d'abord ton token.")
+                return
+            self.login_btn.config(state="disabled")
+            self.status.config(text="Connexion…")
+
+            def work():
+                try:
+                    api = DiscordAPI(token)
+                    me = api.me()
+                    self.events.put(("logged_in", (api, me, api.private_channels())))
+                except FatalError as e:
+                    self.events.put(("error", str(e)))
+                except Exception as e:
+                    self.events.put(("error", f"Connexion impossible : {e}"))
+            self._run(work)
+
+        def browse(self):
+            folder = filedialog.askdirectory(initialdir=self.folder.get() or str(Path.home()))
+            if folder:
+                self.folder.set(folder)
+
+        def open_folder(self):
+            folder = Path(self.folder.get())
+            folder.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(folder)
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(folder)])
+
+        def start(self):
+            channels = [c for c in self.channels if c["id"] in self.selected]
+            if not channels:
+                messagebox.showwarning("Discord Images", "Sélectionne au moins une conversation.")
+                return
             try:
-                self._connect_once()
-            except FatalError:
-                raise
-            except Exception as e:
-                log.warning("Connexion perdue : %s", e)
-            if time.monotonic() - started > 60:
-                backoff = 1
-            delay = backoff + random.random()
-            log.info("Reconnexion dans %.0fs…", delay)
-            time.sleep(delay)
-            backoff = min(backoff * 2, 60)
+                date_from = parse_date(self.date_from.get())
+                date_to = parse_date(self.date_to.get())
+            except ValueError as e:
+                messagebox.showwarning("Discord Images", str(e))
+                return
+            if date_from and date_to and date_from > date_to:
+                messagebox.showwarning("Discord Images", "La date de début est après la date de fin.")
+                return
+            opts = {k: v.get() for k, v in self.opt_vars.items()}
+            opts.update(download_dir=self.folder.get().strip() or DEFAULT_OPTIONS["download_dir"],
+                        date_from=date_from, date_to=date_to)
+            self._save(opts)
 
-    def _send(self, op, d):
-        with self.send_lock:
-            self.ws.send(json.dumps({"op": op, "d": d}))
+            self.cancel.clear()
+            self.login_btn.config(state="disabled")
+            self.start_btn.config(state="disabled")
+            self.cancel_btn.config(state="normal")
+            self.progress.start(12)
+            self.status.config(text="Recherche des images…")
 
-    def _connect_once(self):
-        url = (self.resume_url if self.session_id else GATEWAY) + GATEWAY_QUERY
-        self.ws = websocket.create_connection(url, header=[f"User-Agent: {USER_AGENT}"], timeout=30)
-        self.ws.settimeout(None)
-        hello = json.loads(self.ws.recv())
-        interval = hello["d"]["heartbeat_interval"] / 1000
-        stop = threading.Event()
-        state = {"acked": True}
-        threading.Thread(target=self._heartbeat, args=(interval, stop, state), daemon=True).start()
+            def work():
+                try:
+                    stats = run_download(self.api, channels, opts, self.my_id,
+                                         lambda kind, value: self.events.put((kind, value)),
+                                         self.cancel)
+                    self.events.put(("done", stats))
+                except FatalError as e:
+                    self.events.put(("error", str(e)))
+                except Exception as e:
+                    self.events.put(("error", f"Erreur : {e}"))
+            self._run(work)
 
-        if self.session_id and self.seq is not None:
-            self._send(6, {"token": self.token, "session_id": self.session_id, "seq": self.seq})
-        else:
-            self._identify()
-
-        try:
-            while True:
-                opcode, data = self.ws.recv_data()
-                if opcode == websocket.ABNF.OPCODE_CLOSE:
-                    code = int.from_bytes(data[:2], "big") if len(data) >= 2 else None
-                    if code in FATAL_CLOSE_CODES:
-                        raise FatalError(f"Discord a fermé la connexion : {FATAL_CLOSE_CODES[code]}")
-                    log.info("Discord a fermé la connexion (code %s)", code)
-                    return
-                payload = json.loads(data)
-                op = payload["op"]
-                if op == 0:
-                    self.seq = payload["s"]
-                    if payload["t"] == "READY":
-                        self.session_id = payload["d"]["session_id"]
-                        self.resume_url = payload["d"].get("resume_gateway_url", GATEWAY)
-                    try:
-                        self.on_dispatch(payload["t"], payload["d"])
-                    except FatalError:
-                        raise
-                    except Exception:
-                        log.exception("Erreur pendant le traitement de %s", payload["t"])
-                elif op == 1:
-                    self._send(1, self.seq)
-                elif op == 7:
-                    log.info("Discord demande une reconnexion")
-                    return
-                elif op == 9:
-                    if not payload["d"]:
-                        self.session_id = None
-                        self.seq = None
-                    time.sleep(1 + random.random() * 4)
-                    return
-                elif op == 11:
-                    state["acked"] = True
-        finally:
-            stop.set()
+        def _save(self, opts):
+            self.cfg.update({k: v for k, v in opts.items() if k in DEFAULT_OPTIONS})
+            self.cfg["selected"] = sorted(self.selected)
+            self.cfg["token"] = self.token.get().strip() if self.remember.get() else ""
             try:
-                self.ws.close()
-            except Exception:
+                save_config(self.cfg)
+            except OSError:
                 pass
 
-    def _identify(self):
-        self._send(2, {
-            "token": self.token,
-            "capabilities": 0,
-            "properties": {
-                "os": "Android",
-                "browser": "Chrome",
-                "device": "",
-                "browser_user_agent": USER_AGENT,
-            },
-            "presence": {"status": "unknown", "since": 0, "activities": [], "afk": False},
-            "compress": False,
-        })
+        # ---- événements venant des threads ------------------------------
 
-    def _heartbeat(self, interval, stop, state):
-        if stop.wait(interval * random.random()):
-            return
-        while not stop.is_set():
-            if not state["acked"]:
-                log.warning("Pas de réponse de Discord, reconnexion")
-                try:
-                    self.ws.close()
-                except Exception:
-                    pass
-                return
-            state["acked"] = False
+        def _write_log(self, text):
+            self.log.config(state="normal")
+            self.log.insert("end", text + "\n")
+            self.log.see("end")
+            self.log.config(state="disabled")
+
+        def _poll(self):
             try:
-                self._send(1, self.seq)
-            except Exception:
-                return
-            stop.wait(interval)
+                while True:
+                    kind, value = self.events.get_nowait()
+                    self._handle(kind, value)
+            except queue.Empty:
+                pass
+            self.after(100, self._poll)
 
+        def _handle(self, kind, value):
+            if kind == "logged_in":
+                self.api, me, self.channels = value
+                self.my_id = me["id"]
+                self.user_label.config(text=f"Connecté en tant que {display_name(me)}")
+                self.login_btn.config(state="normal")
+                self.start_btn.config(state="normal")
+                self._save({})
+                self._fill_list()
+            elif kind == "log":
+                self._write_log(value)
+            elif kind == "stats":
+                self.status.config(text=f"{value['saved']} fichier(s) enregistré(s), "
+                                        f"{value['failed']} échec(s)…")
+            elif kind in ("done", "error"):
+                self.progress.stop()
+                self.login_btn.config(state="normal")
+                self.start_btn.config(state="normal" if self.api else "disabled")
+                self.cancel_btn.config(state="disabled")
+                if kind == "error":
+                    self.status.config(text=value)
+                    messagebox.showerror("Discord Images", value)
+                else:
+                    word = "Annulé" if self.cancel.is_set() else "Terminé"
+                    text = (f"{word} : {value['saved']} fichier(s) enregistré(s), "
+                            f"{value['skipped']} déjà présent(s), {value['failed']} échec(s).")
+                    self.status.config(text=text)
+                    self._write_log(text)
 
-# --------------------------------------------------------------------------
-# Application
-# --------------------------------------------------------------------------
-
-class App:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.token = require_token(cfg)
-        self.api = DiscordAPI(self.token)
-        self.downloader = Downloader(cfg)
-        self.my_id = None
-        self.channels = {}  # id -> objet salon
-        self.channels_refreshed = 0.0
-        self.accepted = {}  # id de message -> bool (pour MESSAGE_UPDATE)
-
-    def refresh_channels(self, force=False):
-        if not force and time.monotonic() - self.channels_refreshed < 30:
-            return
-        self.channels_refreshed = time.monotonic()
-        try:
-            self.channels = {c["id"]: c for c in self.api.private_channels()}
-        except FatalError:
-            raise
-        except Exception as e:
-            log.warning("Impossible de récupérer la liste des conversations : %s", e)
-
-    def conversation(self, channel_id, msg=None):
-        channel = self.channels.get(channel_id)
-        if channel is None:
-            self.refresh_channels()
-            channel = self.channels.get(channel_id)
-        if channel is not None:
-            return channel.get("type"), conversation_name(channel)
-        author = (msg or {}).get("author")
-        return None, display_name(author) if author else channel_id
-
-    def handle_message(self, msg, is_update=False):
-        if msg.get("guild_id"):
-            return 0
-        channel_type, name = self.conversation(msg["channel_id"], msg)
-        if is_update and not msg.get("author"):
-            if not self.accepted.get(msg["id"]):
-                return 0
-        elif not should_handle(msg, channel_type, self.cfg, self.my_id):
-            self.accepted[msg["id"]] = False
-            return 0
-        self.accepted[msg["id"]] = True
-        if len(self.accepted) > 2000:
-            for key in list(self.accepted)[:1000]:
-                del self.accepted[key]
-
-        count = 0
-        for url, key, filename in extract_media(msg, self.cfg):
-            path = build_path(self.cfg, name, msg["id"], key, filename)
-            if self.downloader.submit(url, path):
-                count += 1
-        return count
-
-    def on_dispatch(self, event, data):
-        if event == "READY":
-            self.my_id = data["user"]["id"]
-            self.refresh_channels(force=True)
-            suivi = f"{len(self.cfg['channels'])} conversation(s)" if self.cfg["channels"] else "toutes les conversations"
-            log.info("Connecté en tant que %s — suivi : %s", display_name(data["user"]), suivi)
-        elif event == "RESUMED":
-            log.info("Connexion reprise")
-        elif event == "CHANNEL_CREATE" and data.get("type") in (CHANNEL_DM, CHANNEL_GROUP_DM):
-            self.channels[data["id"]] = data
-        elif event == "MESSAGE_CREATE":
-            self.handle_message(data)
-        elif event == "MESSAGE_UPDATE" and data.get("embeds"):
-            # Les aperçus de liens arrivent souvent dans une mise à jour du message.
-            self.handle_message(data, is_update=True)
-
-    def watch(self):
-        log.info("Démarrage… (Ctrl+C pour arrêter)")
-        Gateway(self.token, self.on_dispatch).run_forever()
-
-    def backfill(self, channel_ids=None, days=None):
-        self.my_id = self.api.me()["id"]
-        self.refresh_channels(force=True)
-        targets = channel_ids or self.cfg["channels"] or list(self.channels)
-        after = None
-        if days:
-            cutoff_ms = int((time.time() - days * 86400) * 1000) - DISCORD_EPOCH_MS
-            after = max(cutoff_ms, 0) << 22
-        for cid in targets:
-            channel = self.channels.get(cid)
-            if channel is None:
-                log.warning("Conversation %s introuvable dans tes MP, ignorée", cid)
-                continue
-            if channel.get("type") == CHANNEL_GROUP_DM and not self.cfg["include_group_dms"] and not channel_ids:
-                continue
-            name = conversation_name(channel)
-            log.info("Historique de « %s »…", name)
-            found = 0
-            for msg in self.api.messages(cid, after=after):
-                msg.setdefault("channel_id", cid)
-                found += self.handle_message(msg)
-            log.info("  %d nouveau(x) fichier(s) à télécharger", found)
-        self.downloader.close()
-        log.info("Terminé : %d fichier(s) enregistré(s) dans %s", self.downloader.saved, self.cfg["download_dir"])
-
-
-# --------------------------------------------------------------------------
-# Commandes
-# --------------------------------------------------------------------------
-
-def print_channels(channels, selected=()):
-    for i, c in enumerate(channels, 1):
-        kind = "groupe" if c.get("type") == CHANNEL_GROUP_DM else "MP"
-        mark = "*" if c["id"] in selected else " "
-        print(f"{mark} {i:3d}. [{kind:6s}] {conversation_name(c)}  (id {c['id']})")
-
-
-def cmd_dms(cfg, args):
-    channels = DiscordAPI(require_token(cfg)).private_channels()
-    print_channels(channels, set(cfg["channels"]))
-    if cfg["channels"]:
-        print("\n* = conversation suivie")
-
-
-def cmd_select(cfg, args):
-    channels = DiscordAPI(require_token(cfg)).private_channels()
-    if not channels:
-        print("Aucune conversation privée trouvée.")
-        return
-    print_channels(channels, set(cfg["channels"]))
-    print("\nTape les numéros des conversations à suivre, séparés par des virgules (ex : 1,3,5).")
-    print("Tape « tout » pour suivre toutes les conversations, y compris les futures.")
-    answer = input("> ").strip().lower()
-    if answer in ("tout", "toutes", "all", "*", ""):
-        cfg["channels"] = []
-        print("OK : toutes les conversations privées seront suivies.")
-    else:
-        picked = []
-        for part in re.split(r"[,\s]+", answer):
-            if not part:
-                continue
-            if not part.isdigit() or not 1 <= int(part) <= len(channels):
-                raise FatalError(f"Numéro invalide : {part}")
-            picked.append(channels[int(part) - 1]["id"])
-        cfg["channels"] = picked
-        names = [conversation_name(c) for c in channels if c["id"] in picked]
-        print("OK, conversations suivies : " + ", ".join(names))
-    save_config(args.config, cfg)
-
-
-def cmd_setup(cfg, args):
-    print("Configuration de Discord Images\n")
-    print("Colle ton token Discord (Ctrl+V ou clic droit), puis appuie sur Entrée.")
-    print("Il ne s'affiche pas pendant que tu le colles, c'est normal.")
-    token = getpass.getpass("Token : ").strip().strip('"')
-    if token:
-        cfg["token"] = token
-    me = DiscordAPI(require_token(cfg)).me()
-    print(f"Token valide : connecté en tant que {display_name(me)}\n")
-
-    folder = input(f"Dossier de destination [{cfg['download_dir']}] : ").strip()
-    if folder:
-        cfg["download_dir"] = folder
-    save_config(args.config, cfg)
-    print()
-    cmd_select(cfg, args)
-    print("\nC'est prêt. Lance : python discord_images.py watch")
-
-
-def cmd_watch(cfg, args):
-    app = App(cfg)
-    if args.backfill_days:
-        app.backfill(days=args.backfill_days)
-        app.downloader = Downloader(cfg)
-    app.watch()
-
-
-def cmd_backfill(cfg, args):
-    App(cfg).backfill(channel_ids=args.channel, days=args.days)
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Télécharge automatiquement les images de tes MP Discord.")
-    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"),
-                        help="fichier de configuration (défaut : config.json à côté du script)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="affiche plus de détails")
-    parser.add_argument("--log-file", type=Path, help="écrit le journal dans ce fichier")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    sub.add_parser("setup", help="configure le token, le dossier et les conversations")
-    sub.add_parser("select", help="choisit les conversations à suivre")
-    sub.add_parser("dms", help="liste tes conversations privées")
-    p = sub.add_parser("watch", help="télécharge les nouvelles images en temps réel")
-    p.add_argument("--backfill-days", type=int, metavar="N",
-                   help="récupère d'abord les images des N derniers jours")
-    p = sub.add_parser("backfill", help="télécharge les images de l'historique")
-    p.add_argument("--channel", action="append", metavar="ID",
-                   help="id de conversation (répétable ; défaut : celles de la config)")
-    p.add_argument("--days", type=int, metavar="N", help="seulement les N derniers jours")
-
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        filename=args.log_file, encoding="utf-8",
-                        format="%(asctime)s %(message)s",
-                        datefmt="%Y-%m-%d %H:%M:%S" if args.log_file else "%H:%M:%S")
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-    cfg = load_config(args.config)
-    commands = {"setup": cmd_setup, "select": cmd_select, "dms": cmd_dms,
-                "watch": cmd_watch, "backfill": cmd_backfill}
-    try:
-        commands[args.command](cfg, args)
-    except FatalError as e:
-        if args.log_file:
-            log.error("Erreur : %s", e)
-        else:
-            print(f"Erreur : {e}", file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        print("\nArrêté.")
-    return 0
+    App().mainloop()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    run_gui()

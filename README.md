@@ -1,134 +1,58 @@
 # Discord Images
 
-Télécharge automatiquement les images que tu reçois en message privé sur
-Discord, comme le fait WhatsApp. Les images sont rangées dans un dossier par
-conversation (`Images/Discord/<nom de la conversation>/`).
+Petite application pour enregistrer d'un coup toutes les images de tes
+conversations privées Discord dans un dossier.
 
-Fonctionne sur **ordinateur** (Windows, macOS, Linux) et sur **Android** (via Termux).
-
-- **Temps réel** : chaque image reçue est enregistrée dès son arrivée.
-- **Historique** : récupère aussi les images déjà présentes dans tes conversations.
-- **Au choix** : toutes tes conversations privées, ou seulement celles que tu sélectionnes.
-- **Lecture seule** : l'outil n'envoie jamais de message et ne modifie rien sur ton compte.
+- Tu choisis les conversations (MP et groupes privés).
+- Tu peux limiter à une période (du … au …).
+- Les images avec **spoiler** sont incluses (enregistrées sans le préfixe `SPOILER_`).
+- Options : un sous-dossier par conversation, tes propres images, les vidéos,
+  les images des liens partagés.
+- Une image déjà enregistrée n'est jamais téléchargée deux fois.
+- Lecture seule : l'application n'envoie jamais de message.
 
 ## ⚠️ À savoir avant d'utiliser
 
 Discord ne permet pas aux applications externes de lire tes messages privés.
-Cet outil se connecte donc **avec le token de ton propre compte**, comme le fait
-l'app Discord. C'est contraire aux conditions d'utilisation de Discord :
-le risque est faible pour un usage en lecture seule comme celui-ci, mais
-**il existe un risque que ton compte soit suspendu**. Tu l'utilises à tes risques.
+L'application se connecte donc **avec le token de ton propre compte**. C'est
+contraire aux conditions d'utilisation de Discord : le risque est faible pour
+un usage en lecture seule, mais **ton compte pourrait être suspendu**. Tu
+l'utilises à tes risques.
 
-Ton token donne un accès complet à ton compte : **ne le partage jamais**, ne
-le publie nulle part. Il est enregistré uniquement dans `config.json` sur ton
-appareil (ce fichier est exclu de git).
+Ton token donne un accès complet à ton compte : **ne le partage jamais**. Si
+tu coches « Se souvenir du token », il est enregistré uniquement sur ton
+ordinateur, dans le fichier `.discord_images.json` de ton dossier utilisateur.
+En cas de doute, change ton mot de passe Discord : l'ancien token cesse
+immédiatement de fonctionner.
 
-## Installation sur Windows
+## Installation (Windows)
 
-1. Installe **Python** depuis <https://www.python.org/downloads/>. Pendant
-   l'installation, **coche la case « Add python.exe to PATH »**.
-2. Télécharge l'outil :
-   [fichier ZIP](https://github.com/1Noxcy/Discord-dwnld-image/archive/refs/heads/claude/discord-auto-download-images-0y6r7w.zip),
-   puis fais un clic droit sur le ZIP → **Extraire tout**.
-3. Dans le dossier extrait, double-clique sur **`installer.bat`**. Colle ton
-   token (voir plus bas), valide le dossier proposé, puis choisis tes conversations.
-4. Pour lancer l'outil :
-   - **`lancer.bat`** : ouvre une fenêtre qui récupère les images des 3 derniers
-     jours puis les nouvelles en temps réel, tant que la fenêtre reste ouverte ;
-   - **`demarrage-auto.bat`** (à lancer une seule fois) : l'outil tourne en
-     arrière-plan, sans fenêtre, et redémarre avec Windows. Son journal est
-     dans `discord-images.log`.
+1. Télécharge **`DiscordImages.exe`** depuis la page
+   [Releases](https://github.com/1Noxcy/Discord-dwnld-image/releases/tag/latest).
+2. Double-clique dessus. Si Windows affiche « Windows a protégé votre
+   ordinateur », clique sur **Informations complémentaires** puis **Exécuter
+   quand même** (l'application n'est pas signée, c'est normal).
 
-Par défaut, les images arrivent dans `Images\Discord` de ton dossier
-utilisateur. Pour les avoir aussi sur ton téléphone, choisis comme dossier un
-dossier synchronisé (OneDrive, Google Drive…).
-
-Quand l'ordinateur est éteint, rien n'est téléchargé, mais au démarrage
-suivant l'outil rattrape les 3 derniers jours. Pour remonter plus loin :
-`py discord_images.py backfill`.
-
-## Installation sur Android
-
-1. Installe **Termux** et **Termux:API** depuis [F-Droid](https://f-droid.org/)
-   (les versions du Play Store sont obsolètes). Installe aussi **Termux:Boot**
-   si tu veux que l'outil démarre tout seul quand le téléphone s'allume.
-2. Ouvre Termux et tape :
-
-   ```sh
-   pkg install -y git
-   git clone https://github.com/1Noxcy/Discord-dwnld-image.git
-   cd Discord-dwnld-image
-   bash scripts/install-termux.sh
-   ```
-
-   Accepte la demande d'accès au stockage quand elle apparaît.
-3. Lance la configuration :
-
-   ```sh
-   python discord_images.py setup
-   ```
-
-   Colle ton token, valide le dossier proposé, puis choisis tes conversations.
+Sur macOS ou Linux : installe Python 3, puis `pip install requests` et
+`python discord_images.py`.
 
 ## Récupérer ton token
 
-À faire depuis un ordinateur :
-
 1. Ouvre <https://discord.com/app> dans ton navigateur (Chrome, Firefox,
-   Opera GX…) et connecte-toi.
+   Opera GX…) sur ton ordinateur et connecte-toi.
 2. Ouvre les outils de développement : **Ctrl + Maj + I**, ou clic droit →
    **Inspecter**. Va dans l'onglet **Réseau** (Network).
 3. Tape `messages` dans le filtre, puis clique sur une conversation.
 4. Clique sur la ligne `messages?limit=…` et, dans **En-têtes** → **En-têtes
-   de requête**, copie la valeur de `authorization`. C'est ton token.
-
-Pour l'utiliser sur un téléphone, transfère-le d'une façon privée (pas dans un
-MP Discord !) puis supprime cette copie. Le token change si tu changes ton mot
-de passe : il faudra alors relancer `setup`.
+   de requête**, copie la valeur de `authorization`.
 
 ## Utilisation
 
-Sur Windows, remplace `python` par `py` dans les commandes ci-dessous, à taper
-dans un terminal ouvert dans le dossier de l'outil.
-
-```sh
-python discord_images.py watch                    # télécharge les nouvelles images en continu
-python discord_images.py watch --backfill-days 7  # rattrape d'abord les 7 derniers jours
-python discord_images.py backfill                 # tout l'historique des conversations suivies
-python discord_images.py backfill --days 30       # seulement les 30 derniers jours
-python discord_images.py select                   # change les conversations suivies
-python discord_images.py dms                      # liste tes conversations (* = suivie)
-```
-
-Les images déjà enregistrées ne sont jamais téléchargées deux fois : tu peux
-relancer `backfill` autant que tu veux.
-
-### Démarrage automatique sur Android
-
-Avec **Termux:Boot** installé, le script d'installation a créé
-`~/.termux/boot/discord-images.sh`. Ouvre l'app Termux:Boot une fois, puis
-redémarre le téléphone : l'outil tourne en arrière-plan et écrit son journal
-dans `~/discord-images.log`.
-
-Pour qu'Android ne le coupe pas, va dans **Paramètres → Applications → Termux →
-Batterie** et choisis **Sans restriction** (le nom exact varie selon le téléphone).
-
-## Configuration
-
-Tout est dans `config.json` (créé par `setup`, modèle : `config.example.json`) :
-
-| Option | Défaut | Rôle |
-|---|---|---|
-| `download_dir` | `Images/Discord` (Android : `/storage/emulated/0/Pictures/Discord`) | Dossier où enregistrer les images |
-| `channels` | `[]` | Ids des conversations suivies ; vide = toutes |
-| `include_group_dms` | `true` | Inclure les groupes privés |
-| `include_own_messages` | `false` | Enregistrer aussi les images que tu envoies |
-| `include_videos` | `false` | Enregistrer aussi les vidéos |
-| `include_embeds` | `true` | Enregistrer les images des liens partagés (aperçus) |
-| `subfolder_per_conversation` | `true` | Un album par conversation |
-| `media_scan` | `true` | Afficher immédiatement les images dans la galerie (Termux:API) |
-
-Le token peut aussi être fourni via la variable d'environnement `DISCORD_TOKEN`.
+1. Colle ton token et clique sur **Se connecter**.
+2. Clique sur les conversations voulues (elles passent en bleu), ou sur **Tout**.
+3. Si tu veux, indique une période (format `JJ/MM/AAAA`) et choisis le dossier.
+4. Clique sur **Télécharger**. Les fichiers sont nommés
+   `date_heure_identifiant_nom.ext`, donc triés par date.
 
 ## Développement
 

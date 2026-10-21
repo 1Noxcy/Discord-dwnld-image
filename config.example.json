@@ -1,0 +1,11 @@
+{
+  "token": "",
+  "download_dir": "/storage/emulated/0/Pictures/Discord",
+  "channels": [],
+  "include_group_dms": true,
+  "include_own_messages": false,
+  "include_videos": false,
+  "include_embeds": true,
+  "subfolder_per_conversation": true,
+  "media_scan": true
+}

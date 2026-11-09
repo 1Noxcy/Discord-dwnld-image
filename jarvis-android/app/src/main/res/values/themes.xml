@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Thème de base (fond sombre au lancement, avant que Compose prenne le relais) -->
+    <style name="Theme.Jarvis" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF05080C</item>
+        <item name="android:statusBarColor">#FF05080C</item>
+        <item name="android:navigationBarColor">#FF05080C</item>
+    </style>
+</resources>

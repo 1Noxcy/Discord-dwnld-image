@@ -1,0 +1,45 @@
+# Compile automatiquement l'APK de Jarvis sur les serveurs de GitHub
+# et le publie dans la Release "jarvis-latest" (téléchargeable depuis le téléphone).
+name: Build Jarvis APK
+
+on:
+  push:
+    branches: [ccr-560851ae-nu8gwo, main]
+    paths:
+      - "jarvis-android/**"
+      - ".github/workflows/jarvis-apk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: jarvis-android
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk Jarvis.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-APK
+          path: jarvis-android/Jarvis.apk
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: jarvis-latest
+          name: Jarvis (Android)
+          body: Ouvre cette page sur ton téléphone, touche Jarvis.apk pour le télécharger, puis ouvre-le pour l'installer.
+          files: jarvis-android/Jarvis.apk
+          make_latest: false
